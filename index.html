@@ -293,6 +293,12 @@
       gap: 1rem;
     }
 
+    .grid-3 {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 1rem;
+    }
+
     .flex-col {
       display: flex;
       flex-direction: column;
@@ -329,19 +335,35 @@
   <div id="app"></div>
 
   <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.3.2/papaparse.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
   
   <script>
+    // Suppress XLSX console warnings about compression
+    const originalConsoleError = console.error;
+    console.error = function(...args) {
+      const message = args.join(' ');
+      if (message.includes('uncompressed size') || message.includes('Bad uncompressed')) {
+        // Suppress these specific warnings
+        return;
+      }
+      originalConsoleError.apply(console, args);
+    };
+
     const SHEETS_URL = 'YOUR_GOOGLE_APPS_SCRIPT_URL_HERE';
 
     let state = {
       stage: 'home',
       slottingData: null,
       cycleCountData: null,
+      locationVerificationData: null,
       employeeName: '',
       currentIndex: 0,
       mode: null,
       attemptNumber: 0,
-      firstCountValue: null
+      firstCountValue: null,
+      verificationStep: 'location', // 'location', 'sku', or 'quantity'
+      skuAttempts: 0,
+      wrongSku: null
     };
 
     function parseCSV(file, type) {
@@ -359,6 +381,38 @@
           showAlert(`Error parsing file: ${error.message}`, 'error');
         }
       });
+    }
+
+    function parseExcel(file, type) {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        try {
+          const data = new Uint8Array(e.target.result);
+          // Use cellDates and cellNF options, and ignore compression errors
+          const workbook = XLSX.read(data, { 
+            type: 'array',
+            cellDates: true,
+            cellNF: false,
+            WTF: false // Suppress warnings
+          });
+          const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
+          const jsonData = XLSX.utils.sheet_to_json(firstSheet, {
+            raw: false,
+            defval: ''
+          });
+          
+          if (type === 'verification') {
+            validateLocationVerificationData(jsonData);
+          }
+        } catch (error) {
+          console.error('Excel parsing error:', error);
+          showAlert(`Error parsing Excel file: ${error.message}`, 'error');
+        }
+      };
+      reader.onerror = () => {
+        showAlert('Error reading file', 'error');
+      };
+      reader.readAsArrayBuffer(file);
     }
 
     function validateSlottingData(data) {
@@ -424,6 +478,45 @@
 
       state.cycleCountData = normalized;
       showAlert(`✅ Cycle count file loaded: ${normalized.length} locations`, 'success');
+      render();
+    }
+
+    function validateLocationVerificationData(data) {
+      const requiredHeaders = ['location', 'sku', 'location on hand'];
+      if (data.length === 0) {
+        showAlert('File is empty', 'error');
+        return;
+      }
+
+      const headers = Object.keys(data[0]).map(h => h.toLowerCase().trim());
+      const hasRequired = requiredHeaders.every(h => 
+        headers.some(header => header.includes(h.replace(' on hand', '')) || header === h)
+      );
+      
+      if (!hasRequired) {
+        showAlert(`Missing required columns: Location, SKU, Location On Hand`, 'error');
+        return;
+      }
+
+      const normalized = data.map(row => {
+        const location = row.Location || row.location || row.LOCATION || '';
+        const sku = row.SKU || row.sku || '';
+        const onHand = row['Location On Hand'] || row['location on hand'] || row.on_hand || 0;
+        
+        return {
+          location: String(location).trim().toUpperCase(),
+          sku: String(sku).trim().toUpperCase(),
+          on_hand: parseInt(onHand) || 0
+        };
+      }).filter(row => row.location && row.sku);
+
+      if (normalized.length === 0) {
+        showAlert('No valid location verification records found', 'error');
+        return;
+      }
+
+      state.locationVerificationData = normalized;
+      showAlert(`✅ Location verification file loaded: ${normalized.length} locations`, 'success');
       render();
     }
 
@@ -629,6 +722,189 @@
       }
     }
 
+    // Location Verification Functions
+    function startLocationVerification() {
+      if (!state.locationVerificationData) {
+        alert('No location verification file loaded');
+        return;
+      }
+      state.mode = 'location_verification';
+      state.currentIndex = 0;
+      state.verificationStep = 'location';
+      state.skuAttempts = 0;
+      state.wrongSku = null;
+      state.stage = 'location_verification';
+      render();
+    }
+
+    function verifyLocation() {
+      const scannedLocation = document.getElementById('locationVerifyInput').value.trim().toUpperCase();
+      const current = state.locationVerificationData[state.currentIndex];
+
+      if (!scannedLocation) {
+        showVerificationAlert('⚠️ Please scan or enter a location', 'error');
+        return;
+      }
+
+      if (scannedLocation !== current.location) {
+        showVerificationAlert(`❌ Wrong location! Expected: ${current.location}`, 'error');
+        document.getElementById('locationVerifyInput').value = '';
+        document.getElementById('locationVerifyInput').focus();
+        
+        logToSheets({
+          location: current.location,
+          expected_sku: current.sku,
+          scanned_location: scannedLocation,
+          status: 'wrong_location',
+          step_index: state.currentIndex + 1,
+          step_total: state.locationVerificationData.length
+        });
+        return;
+      }
+
+      showVerificationAlert('✅ Location verified! Now scan SKU', 'success');
+      state.verificationStep = 'sku';
+      
+      logToSheets({
+        location: current.location,
+        expected_sku: current.sku,
+        scanned_location: scannedLocation,
+        status: 'location_verified',
+        step_index: state.currentIndex + 1,
+        step_total: state.locationVerificationData.length
+      });
+      
+      setTimeout(() => render(), 800);
+    }
+
+    function verifySku() {
+      const scannedSku = document.getElementById('skuVerifyInput').value.trim().toUpperCase();
+      const current = state.locationVerificationData[state.currentIndex];
+
+      if (!scannedSku) {
+        showVerificationAlert('⚠️ Please scan or enter a SKU', 'error');
+        return;
+      }
+
+      if (scannedSku !== current.sku) {
+        state.skuAttempts++;
+        
+        if (state.skuAttempts === 1) {
+          state.wrongSku = scannedSku;
+          showVerificationAlert(`❌ Wrong SKU! Try again. Expected: ${current.sku}`, 'error');
+          document.getElementById('skuVerifyInput').value = '';
+          document.getElementById('skuVerifyInput').focus();
+          
+          logToSheets({
+            location: current.location,
+            expected_sku: current.sku,
+            scanned_sku: scannedSku,
+            status: 'wrong_sku_attempt_1',
+            step_index: state.currentIndex + 1,
+            step_total: state.locationVerificationData.length
+          });
+          return;
+        } else if (state.skuAttempts === 2 && scannedSku === state.wrongSku) {
+          // Same wrong SKU twice, ask for quantity
+          showVerificationAlert('⚠️ Same SKU scanned twice. Please enter quantity', 'warning');
+          state.verificationStep = 'quantity';
+          
+          logToSheets({
+            location: current.location,
+            expected_sku: current.sku,
+            scanned_sku: scannedSku,
+            status: 'wrong_sku_attempt_2_same',
+            step_index: state.currentIndex + 1,
+            step_total: state.locationVerificationData.length
+          });
+          
+          setTimeout(() => render(), 800);
+          return;
+        } else {
+          // Different wrong SKU on second attempt
+          showVerificationAlert(`❌ Still wrong! Expected: ${current.sku}`, 'error');
+          document.getElementById('skuVerifyInput').value = '';
+          document.getElementById('skuVerifyInput').focus();
+          
+          logToSheets({
+            location: current.location,
+            expected_sku: current.sku,
+            scanned_sku: scannedSku,
+            status: 'wrong_sku_attempt_2_different',
+            step_index: state.currentIndex + 1,
+            step_total: state.locationVerificationData.length
+          });
+          return;
+        }
+      }
+
+      // Correct SKU
+      showVerificationAlert('✅ SKU verified! Moving to next location', 'success');
+      
+      logToSheets({
+        location: current.location,
+        expected_sku: current.sku,
+        scanned_sku: scannedSku,
+        status: 'sku_verified_correct',
+        step_index: state.currentIndex + 1,
+        step_total: state.locationVerificationData.length
+      });
+      
+      setTimeout(() => moveToNextVerification(), 1000);
+    }
+
+    function submitQuantity() {
+      const quantity = parseInt(document.getElementById('quantityInput').value);
+      const current = state.locationVerificationData[state.currentIndex];
+
+      if (isNaN(quantity) || quantity < 0) {
+        showVerificationAlert('⚠️ Please enter a valid quantity', 'error');
+        return;
+      }
+
+      showVerificationAlert(`✓ Quantity recorded: ${quantity}. Moving to next location`, 'success');
+      
+      logToSheets({
+        location: current.location,
+        expected_sku: current.sku,
+        scanned_sku: state.wrongSku,
+        entered_quantity: quantity,
+        expected_quantity: current.on_hand,
+        status: 'wrong_sku_quantity_entered',
+        step_index: state.currentIndex + 1,
+        step_total: state.locationVerificationData.length
+      });
+      
+      setTimeout(() => moveToNextVerification(), 1200);
+    }
+
+    function skipVerification() {
+      const current = state.locationVerificationData[state.currentIndex];
+      
+      logToSheets({
+        location: current.location,
+        expected_sku: current.sku,
+        status: 'skipped',
+        step_index: state.currentIndex + 1,
+        step_total: state.locationVerificationData.length
+      });
+
+      moveToNextVerification();
+    }
+
+    function moveToNextVerification() {
+      if (state.currentIndex < state.locationVerificationData.length - 1) {
+        state.currentIndex++;
+        state.verificationStep = 'location';
+        state.skuAttempts = 0;
+        state.wrongSku = null;
+        render();
+      } else {
+        state.stage = 'complete';
+        render();
+      }
+    }
+
     function showAlert(message, type) {
       const alertDiv = document.getElementById('globalAlert');
       if (!alertDiv) return;
@@ -642,17 +918,26 @@
       alertDiv.innerHTML = `<div class="alert alert-${type}">${message}</div>`;
     }
 
+    function showVerificationAlert(message, type) {
+      const alertDiv = document.getElementById('verificationAlert');
+      alertDiv.innerHTML = `<div class="alert alert-${type}">${message}</div>`;
+    }
+
     function goHome() {
       if (confirm('Go back to home? Progress will be lost.')) {
         state = {
           stage: 'home',
           slottingData: state.slottingData,
           cycleCountData: state.cycleCountData,
+          locationVerificationData: state.locationVerificationData,
           employeeName: '',
           currentIndex: 0,
           mode: null,
           attemptNumber: 0,
-          firstCountValue: null
+          firstCountValue: null,
+          verificationStep: 'location',
+          skuAttempts: 0,
+          wrongSku: null
         };
         render();
       }
@@ -662,7 +947,13 @@
       const input = document.getElementById(inputId);
       input.addEventListener('change', (e) => {
         const file = e.target.files[0];
-        if (file) parseCSV(file, type);
+        if (file) {
+          if (type === 'verification') {
+            parseExcel(file, type);
+          } else {
+            parseCSV(file, type);
+          }
+        }
       });
     }
 
@@ -671,7 +962,7 @@
       let content = '';
 
       if (state.stage === 'home') {
-        const filesReady = state.slottingData || state.cycleCountData;
+        const filesReady = state.slottingData || state.cycleCountData || state.locationVerificationData;
         content = `
           <div class="gradient-bg grid-bg" style="min-height: 100vh; position: relative;">
             <div class="orb orb-1"></div>
@@ -733,12 +1024,12 @@
                 <p style="color: #9D9F9E; font-size: 0.875rem; margin-bottom: 1.5rem;">Required: sku, from_location, to_location</p>
                 <input type="file" id="slottingFile" accept=".csv,.tsv" style="display: none;">
                 <button onclick="document.getElementById('slottingFile').click()" class="btn btn-secondary">
-                  📁 Upload Slotting File
+                  📁 Upload Slotting File (CSV)
                 </button>
                 ${state.slottingData ? `<p style="text-align: center; color: #A3F3C5; font-size: 0.875rem; margin-top: 1rem;">${state.slottingData.length} moves loaded</p>` : ''}
               </div>
 
-              <div style="background: rgba(255, 255, 255, 0.05); backdrop-filter: blur(10px); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 1rem; padding: 2rem;">
+              <div style="margin-bottom: 2rem; background: rgba(255, 255, 255, 0.05); backdrop-filter: blur(10px); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 1rem; padding: 2rem;">
                 <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 1rem;">
                   <h3 style="font-size: 1.5rem; font-weight: 300; color: #A3F3C5;">Cycle Count File</h3>
                   <span style="padding: 0.5rem 1rem; border-radius: 9999px; font-size: 0.875rem; font-weight: 600; ${state.cycleCountData ? 'background: rgba(6, 78, 59, 0.2); color: #34d399;' : 'background: rgba(127, 29, 29, 0.2); color: #f87171;'}">
@@ -748,9 +1039,24 @@
                 <p style="color: #9D9F9E; font-size: 0.875rem; margin-bottom: 1.5rem;">Required: location, on_hand</p>
                 <input type="file" id="cycleFile" accept=".csv,.tsv" style="display: none;">
                 <button onclick="document.getElementById('cycleFile').click()" class="btn btn-secondary">
-                  📁 Upload Cycle Count File
+                  📁 Upload Cycle Count File (CSV)
                 </button>
                 ${state.cycleCountData ? `<p style="text-align: center; color: #A3F3C5; font-size: 0.875rem; margin-top: 1rem;">${state.cycleCountData.length} locations loaded</p>` : ''}
+              </div>
+
+              <div style="background: rgba(255, 255, 255, 0.05); backdrop-filter: blur(10px); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 1rem; padding: 2rem;">
+                <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 1rem;">
+                  <h3 style="font-size: 1.5rem; font-weight: 300; color: #A3F3C5;">Location Verification File</h3>
+                  <span style="padding: 0.5rem 1rem; border-radius: 9999px; font-size: 0.875rem; font-weight: 600; ${state.locationVerificationData ? 'background: rgba(6, 78, 59, 0.2); color: #34d399;' : 'background: rgba(127, 29, 29, 0.2); color: #f87171;'}">
+                    ${state.locationVerificationData ? '✓ Loaded' : '✗ Not Loaded'}
+                  </span>
+                </div>
+                <p style="color: #9D9F9E; font-size: 0.875rem; margin-bottom: 1.5rem;">Required: Location, SKU, Location On Hand (Excel file)</p>
+                <input type="file" id="verificationFile" accept=".xlsx,.xls" style="display: none;">
+                <button onclick="document.getElementById('verificationFile').click()" class="btn btn-secondary">
+                  📁 Upload Location Verification File (Excel)
+                </button>
+                ${state.locationVerificationData ? `<p style="text-align: center; color: #A3F3C5; font-size: 0.875rem; margin-top: 1rem;">${state.locationVerificationData.length} locations loaded</p>` : ''}
               </div>
             </div>
           </div>
@@ -771,7 +1077,7 @@
                 <input type="text" id="employeeName" class="input" placeholder="Enter your name or ID" autofocus>
               </div>
 
-              <div class="grid-2">
+              <div class="grid-3">
                 <button onclick="if(document.getElementById('employeeName').value.trim()) { state.employeeName = document.getElementById('employeeName').value.trim(); startCycleCount(); } else { alert('Please enter your name or ID'); }" ${!state.cycleCountData ? 'disabled' : ''} class="glass" style="border-radius: 1rem; padding: 2.5rem; text-align: center; cursor: pointer; transition: all 0.3s;">
                   <div style="font-size: 3rem; margin-bottom: 1rem;">📊</div>
                   <span style="font-size: 1.5rem; font-weight: 300; display: block; margin-bottom: 0.5rem;">Cycle Count</span>
@@ -782,6 +1088,12 @@
                   <div style="font-size: 3rem; margin-bottom: 1rem;">📦</div>
                   <span style="font-size: 1.5rem; font-weight: 300; display: block; margin-bottom: 0.5rem;">Slotting</span>
                   <div style="color: #9D9F9E; font-size: 0.875rem;">${state.slottingData ? `${state.slottingData.length} moves` : 'No file loaded'}</div>
+                </button>
+
+                <button onclick="if(document.getElementById('employeeName').value.trim()) { state.employeeName = document.getElementById('employeeName').value.trim(); startLocationVerification(); } else { alert('Please enter your name or ID'); }" ${!state.locationVerificationData ? 'disabled' : ''} class="glass" style="border-radius: 1rem; padding: 2.5rem; text-align: center; cursor: pointer; transition: all 0.3s;">
+                  <div style="font-size: 3rem; margin-bottom: 1rem;">🔍</div>
+                  <span style="font-size: 1.5rem; font-weight: 300; display: block; margin-bottom: 0.5rem;">Location Verification</span>
+                  <div style="color: #9D9F9E; font-size: 0.875rem;">${state.locationVerificationData ? `${state.locationVerificationData.length} locations` : 'No file loaded'}</div>
                 </button>
               </div>
             </div>
@@ -896,19 +1208,166 @@
             </div>
           </div>
         `;
+      } else if (state.stage === 'location_verification') {
+        const current = state.locationVerificationData[state.currentIndex];
+        const progress = ((state.currentIndex / state.locationVerificationData.length) * 100).toFixed(0);
+        
+        if (state.verificationStep === 'location') {
+          content = `
+            <button onclick="goHome()" class="home-btn">
+              🏠 Home
+            </button>
+            
+            <div class="gradient-bg grid-bg container">
+              <div class="card scale-in">
+                <div style="text-align: right; margin-bottom: 1.5rem; color: #A3F3C5; font-weight: 600;">
+                  Location Verification: ${state.employeeName}
+                </div>
+
+                <div class="progress-bar">
+                  <div class="progress-fill" style="width: ${progress}%"></div>
+                </div>
+                <div style="text-align: center; color: #9D9F9E; font-size: 0.875rem; font-weight: 600; margin-top: 0.75rem;">
+                  Location ${state.currentIndex + 1} of ${state.locationVerificationData.length}
+                </div>
+
+                <div class="location-card">
+                  <div class="location-label">Go to Location</div>
+                  <div class="location-value">${current.location}</div>
+                  <div style="margin-top: 1rem; padding: 1rem 1.5rem; background: rgba(255, 255, 255, 0.1); backdrop-filter: blur(10px); border-radius: 0.75rem; display: inline-block; color: #EDEFED;">
+                    Expected On Hand: ${current.on_hand}
+                  </div>
+                </div>
+
+                <div id="verificationAlert"></div>
+
+                <div style="margin-bottom: 1.5rem;">
+                  <label style="display: block; font-size: 0.875rem; font-weight: 600; color: #9D9F9E; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.75rem;">
+                    🔍 Scan Location
+                  </label>
+                  <input type="text" id="locationVerifyInput" class="input" placeholder="Scan location barcode" style="font-size: 1.5rem; font-family: 'Courier New', monospace; text-align: center;" autofocus>
+                </div>
+
+                <div class="grid-2">
+                  <button onclick="verifyLocation()" class="btn btn-primary glow">
+                    ✓ Verify Location
+                  </button>
+                  <button onclick="skipVerification()" class="btn btn-secondary">
+                    Skip
+                  </button>
+                </div>
+              </div>
+            </div>
+          `;
+        } else if (state.verificationStep === 'sku') {
+          content = `
+            <button onclick="goHome()" class="home-btn">
+              🏠 Home
+            </button>
+            
+            <div class="gradient-bg grid-bg container">
+              <div class="card scale-in">
+                <div style="text-align: right; margin-bottom: 1.5rem; color: #A3F3C5; font-weight: 600;">
+                  Location Verification: ${state.employeeName}
+                </div>
+
+                <div class="progress-bar">
+                  <div class="progress-fill" style="width: ${progress}%"></div>
+                </div>
+                <div style="text-align: center; color: #9D9F9E; font-size: 0.875rem; font-weight: 600; margin-top: 0.75rem;">
+                  Location ${state.currentIndex + 1} of ${state.locationVerificationData.length}
+                </div>
+
+                <div class="location-card">
+                  <div class="location-label">Verify SKU at</div>
+                  <div class="location-value">${current.location}</div>
+                  <div style="margin-top: 1rem; padding: 1rem 1.5rem; background: rgba(255, 255, 255, 0.1); backdrop-filter: blur(10px); border-radius: 0.75rem; display: inline-block; color: #EDEFED;">
+                    Expected SKU: ${current.sku}
+                  </div>
+                </div>
+
+                <div id="verificationAlert"></div>
+
+                <div style="margin-bottom: 1.5rem;">
+                  <label style="display: block; font-size: 0.875rem; font-weight: 600; color: #9D9F9E; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.75rem;">
+                    📦 Scan SKU ${state.skuAttempts > 0 ? '(Attempt ' + (state.skuAttempts + 1) + ')' : ''}
+                  </label>
+                  <input type="text" id="skuVerifyInput" class="input" placeholder="Scan SKU barcode" style="font-size: 1.5rem; font-family: 'Courier New', monospace; text-align: center;" autofocus>
+                </div>
+
+                <div class="grid-2">
+                  <button onclick="verifySku()" class="btn btn-primary glow">
+                    ✓ Verify SKU
+                  </button>
+                  <button onclick="skipVerification()" class="btn btn-secondary">
+                    Skip
+                  </button>
+                </div>
+              </div>
+            </div>
+          `;
+        } else if (state.verificationStep === 'quantity') {
+          content = `
+            <button onclick="goHome()" class="home-btn">
+              🏠 Home
+            </button>
+            
+            <div class="gradient-bg grid-bg container">
+              <div class="card scale-in">
+                <div style="text-align: right; margin-bottom: 1.5rem; color: #A3F3C5; font-weight: 600;">
+                  Location Verification: ${state.employeeName}
+                </div>
+
+                <div class="progress-bar">
+                  <div class="progress-fill" style="width: ${progress}%"></div>
+                </div>
+                <div style="text-align: center; color: #9D9F9E; font-size: 0.875rem; font-weight: 600; margin-top: 0.75rem;">
+                  Location ${state.currentIndex + 1} of ${state.locationVerificationData.length}
+                </div>
+
+                <div class="location-card">
+                  <div class="location-label">Enter Quantity at</div>
+                  <div class="location-value">${current.location}</div>
+                  <div style="margin-top: 1rem; padding: 1rem 1.5rem; background: rgba(255, 255, 255, 0.1); backdrop-filter: blur(10px); border-radius: 0.75rem; display: inline-block; color: #EDEFED;">
+                    Scanned SKU: ${state.wrongSku}<br>
+                    Expected SKU: ${current.sku}
+                  </div>
+                </div>
+
+                <div id="verificationAlert"></div>
+
+                <div style="margin-bottom: 1.5rem;">
+                  <label style="display: block; font-size: 0.875rem; font-weight: 600; color: #9D9F9E; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.75rem;">
+                    📊 Enter Quantity of ${state.wrongSku}
+                  </label>
+                  <input type="number" id="quantityInput" class="input" placeholder="0" min="0" style="font-size: 1.5rem; font-family: 'Courier New', monospace; text-align: center;" autofocus>
+                </div>
+
+                <div class="grid-2">
+                  <button onclick="submitQuantity()" class="btn btn-primary glow">
+                    ✓ Submit Quantity
+                  </button>
+                  <button onclick="skipVerification()" class="btn btn-secondary">
+                    Skip
+                  </button>
+                </div>
+              </div>
+            </div>
+          `;
+        }
       } else if (state.stage === 'complete') {
         content = `
           <div class="gradient-bg grid-bg container">
             <div class="card scale-in" style="text-align: center; padding: 4rem;">
               <div style="font-size: 5rem; margin-bottom: 2rem;">🎉</div>
               <h2 style="font-size: 3.75rem; font-weight: 300; margin-bottom: 1.5rem; background: linear-gradient(to right, white, #A3F3C5); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;">
-                ${state.mode === 'slotting' ? 'Slotting' : 'Cycle Count'} Complete!
+                ${state.mode === 'slotting' ? 'Slotting' : state.mode === 'cycle_count' ? 'Cycle Count' : 'Location Verification'} Complete!
               </h2>
               <p style="color: #9D9F9E; font-size: 1.25rem; margin-bottom: 3rem; font-weight: 300;">
                 Great work, ${state.employeeName}! All tasks have been completed and logged.
               </p>
               
-              <button onclick="state.stage = 'home'; state.currentIndex = 0; state.mode = null; state.employeeName = ''; state.attemptNumber = 0; state.firstCountValue = null; render();" class="btn btn-primary glow">
+              <button onclick="state.stage = 'home'; state.currentIndex = 0; state.mode = null; state.employeeName = ''; state.attemptNumber = 0; state.firstCountValue = null; state.verificationStep = 'location'; state.skuAttempts = 0; state.wrongSku = null; render();" class="btn btn-primary glow">
                 Back to Home
               </button>
             </div>
@@ -922,6 +1381,7 @@
         setTimeout(() => {
           setupFileUpload('slottingFile', 'slotting');
           setupFileUpload('cycleFile', 'cycle');
+          setupFileUpload('verificationFile', 'verification');
         }, 100);
       }
 
@@ -934,6 +1394,36 @@
           document.getElementById('countInput').addEventListener('keypress', (e) => {
             if (e.key === 'Enter') submitCycleCount();
           });
+        }, 100);
+      }
+
+      if (state.stage === 'location_verification') {
+        setTimeout(() => {
+          if (state.verificationStep === 'location') {
+            const input = document.getElementById('locationVerifyInput');
+            if (input) {
+              input.focus();
+              input.addEventListener('keypress', (e) => {
+                if (e.key === 'Enter') verifyLocation();
+              });
+            }
+          } else if (state.verificationStep === 'sku') {
+            const input = document.getElementById('skuVerifyInput');
+            if (input) {
+              input.focus();
+              input.addEventListener('keypress', (e) => {
+                if (e.key === 'Enter') verifySku();
+              });
+            }
+          } else if (state.verificationStep === 'quantity') {
+            const input = document.getElementById('quantityInput');
+            if (input) {
+              input.focus();
+              input.addEventListener('keypress', (e) => {
+                if (e.key === 'Enter') submitQuantity();
+              });
+            }
+          }
         }, 100);
       }
 
